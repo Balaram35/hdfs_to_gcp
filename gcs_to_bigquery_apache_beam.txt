@@ -1,0 +1,110 @@
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions, GoogleCloudOptions
+
+# Define your GCS and BigQuery configurations
+project_id = 'gcp-to-bigquery-schemav'
+output_table = f'{project_id}:Test2.Employee'
+
+# Define pipeline options
+options = PipelineOptions(
+    temp_location='gs://temp_store_alti/temp/',
+    runner='DirectRunner'
+)
+
+# Use GoogleCloudOptions to specify project and region
+google_cloud_options = options.view_as(GoogleCloudOptions)
+google_cloud_options.project = project_id
+google_cloud_options.region = 'us-central1'
+
+schema = {
+    'fields': [
+        {'name': 'EMPLOYEE_ID', 'type': 'STRING'},
+        {'name': 'FIRST_NAME', 'type': 'STRING'},
+        {'name': 'LAST_NAME', 'type': 'STRING'},
+        {'name': 'EMAIL', 'type': 'STRING'},
+        {'name': 'PHONE_NUMBER', 'type': 'STRING'},
+        {'name': 'HIRE_DATE', 'type': 'STRING'},
+        {'name': 'JOB_ID', 'type': 'STRING'},
+        {'name': 'SALARY', 'type': 'STRING'},
+        {'name': 'COMMISSION_PCT', 'type': 'STRING'},
+        {'name': 'MANAGER_ID', 'type': 'STRING'},
+        {'name': 'DEPARTMENT_ID', 'type': 'STRING'}
+    ]
+}
+
+class ParseCSV(beam.DoFn):
+    def process(self, element):
+        fields = element.split(',')
+        try:
+            parsed_record = {
+                'EMPLOYEE_ID': fields[0],
+                'FIRST_NAME': fields[1],
+                'LAST_NAME': fields[2],
+                'EMAIL': fields[3],
+                'PHONE_NUMBER': fields[4],
+                'HIRE_DATE': fields[5],
+                'JOB_ID': fields[6],
+                'SALARY': fields[7],
+                'COMMISSION_PCT': fields[8],
+                'MANAGER_ID': fields[9],
+                'DEPARTMENT_ID': fields[10]
+            }
+            yield parsed_record
+        except (IndexError, ValueError) as e:
+            yield beam.pvalue.TaggedOutput('failed_records', element)
+
+def process_pipeline(bucket_and_file):
+    bucket, name = bucket_and_file
+    input_file = f'gs://{bucket}/{name}'
+
+    with beam.Pipeline(options=options) as pipeline:
+        lines = pipeline | 'ReadFromGCS' >> beam.io.ReadFromText(input_file)
+
+        separated_data = lines | beam.ParDo(ParseCSV()).with_outputs(
+            'failed_records', main='main'
+        )
+
+        main_records = separated_data.main
+        failed_records = separated_data.failed_records
+
+        main_records | 'WriteToBigQuery' >> beam.io.WriteToBigQuery(
+            table=output_table,
+            schema=schema,
+            create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED,
+            write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
+            custom_gcs_temp_location='gs://temp_store_alti/temp/'  # Ensure temporary storage location is set
+        )
+
+        non_matching_output_path = f'gs://invalid_records/non_matching_records.txt'
+        failed_records | 'WriteFailedToGCS' >> beam.io.WriteToText(non_matching_output_path)
+
+def run():
+    with beam.Pipeline(options=options) as pipeline:
+        query = f"""
+        SELECT 
+            bucket, 
+            name
+        FROM (
+            SELECT 
+                bucket, 
+                name, 
+                MAX(time_created) AS time_created
+            FROM `{project_id}.gcs_dataset.gcs_files`
+            GROUP BY bucket, name
+        )
+        WHERE time_created = (
+            SELECT MAX(time_created) 
+            FROM `{project_id}.gcs_dataset.gcs_files`
+        )
+        LIMIT 1
+        """
+        bq_values = (
+            pipeline
+            | "Read Bucket and File from BigQuery" >> beam.io.ReadFromBigQuery(query=query, use_standard_sql=True)
+            | "Extract Bucket and File" >> beam.Map(lambda x: (x['bucket'], x['name']))
+        )
+
+        bq_values | "Process Pipeline" >> beam.Map(process_pipeline)
+
+if __name__ == '__main__':
+    run()
